@@ -447,20 +447,12 @@ function buildFetch(
         // REWRITE ENDPOINT: Handle both path mapping and potential /v1/v1 duplicates
         const baseUrlObj = new URL(url)
         let path = baseUrlObj.pathname
-        console.log(`\x1b[44m\x1b[37m[BRIDGE] ORIG PATH: ${path}\x1b[0m`)
-        
         if (path.includes('/v1/messages')) {
             path = path.replace(/\/v1\/(v1\/)?messages$/, '/v1/chat/completions')
             url = `${baseUrlObj.origin}${path}` // This naturally strips the query string
-            const logRewritten = `[BRIDGE] REWRITTEN TO: ${url} at ${new Date().toISOString()}\n`;
-            try { require('node:fs').appendFileSync('bridge.log', logRewritten); } catch (e) {}
-            console.log(`\x1b[44m\x1b[37m${logRewritten.trim()}\x1b[0m`)
         } else if (path.includes('/v1/v1/')) {
             path = path.replace(/\/v1\/v1\//, '/v1/')
             url = `${baseUrlObj.origin}${path}`
-            const logNormalized = `[BRIDGE] NORMALIZED TO: ${url} at ${new Date().toISOString()}\n`;
-            try { require('node:fs').appendFileSync('bridge.log', logNormalized); } catch (e) {}
-            console.log(`\x1b[44m\x1b[37m${logNormalized.trim()}\x1b[0m`)
         }
 
         const response = await (async () => {
@@ -526,12 +518,6 @@ function buildFetch(
               }
 
               const finalBody = JSON.stringify(openAiBody)
-              // Log FULL body for one final check
-              const logFinal = `[BRIDGE] SENDING CLEAN BODY: ${JSON.stringify(openAiBody, null, 2)} at ${new Date().toISOString()}\n`;
-              try { require('node:fs').appendFileSync('bridge.log', logFinal); } catch (e) {}
-              
-              // Only log first 200 chars to console to avoid cluttering TUI
-              console.log(`\x1b[44m\x1b[37m[BRIDGE] Sending ${openAiBody.model} request...\x1b[0m`)
 
               const res = await inner(url, {
                 ...init,
@@ -539,14 +525,7 @@ function buildFetch(
                 body: finalBody
               })
 
-              const logStatus = `[BRIDGE] RESPONSE STATUS: ${res.status} at ${new Date().toISOString()}\n`;
-              try { require('node:fs').appendFileSync('bridge.log', logStatus); } catch (e) {}
-
               if (!res.ok) {
-                  const errorText = await res.clone().text();
-                  const logErrorBody = `[BRIDGE] ERROR RESPONSE BODY: ${errorText} at ${new Date().toISOString()}\n`;
-                  try { require('node:fs').appendFileSync('bridge.log', logErrorBody); } catch (e) {}
-                  console.log(`\x1b[41m\x1b[37m${logErrorBody.trim()}\x1b[0m`)
                   return res;
               }
 
@@ -590,9 +569,6 @@ function buildFetch(
                           }
                       }
 
-                      const logBridgeRes = `[BRIDGE] CONVERTED RESPONSE: ${JSON.stringify(anthropicRes, null, 2)} at ${new Date().toISOString()}\n`;
-                      try { require('node:fs').appendFileSync('bridge.log', logBridgeRes); } catch (e) {}
-
                       return new Response(JSON.stringify(anthropicRes), {
                           status: res.status,
                           statusText: res.statusText,
@@ -600,22 +576,19 @@ function buildFetch(
                       });
                   }
               } catch (bridgeErr) {
-                  const logBridgeErr = `[BRIDGE] RESPONSE BRIDGE FAILED: ${bridgeErr} at ${new Date().toISOString()}\n`;
-                  try { require('node:fs').appendFileSync('bridge.log', logBridgeErr); } catch (e) {}
+                  // Silent fail, return original res
               }
 
               return res;
 
             } catch (e) {
-              console.log(`\x1b[41m\x1b[37m[BRIDGE] Body transform failed: ${e}\x1b[0m`)
+              // Ignore body transform errors
             }
           }
           return await inner(url, { ...init, headers: newHeaders })
         })()
 
-        const logStatus = `[BRIDGE] RESPONSE STATUS: ${response.status} at ${new Date().toISOString()}\n`;
-        try { require('node:fs').appendFileSync('bridge.log', logStatus); } catch (e) {}
-        console.log(`\x1b[44m\x1b[37m${logStatus.trim()}\x1b[0m`)
+        return response
 
         // Handle Streaming: Translate OpenAI SSE -> Anthropic SSE
         if (response.ok && response.headers.get('content-type')?.includes('text/event-stream')) {
