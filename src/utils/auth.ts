@@ -98,7 +98,13 @@ function isManagedOAuthContext(): boolean {
 /** Whether we are supporting direct 1P auth. */
 // this code is closely related to getAuthTokenSource
 export function isAnthropicAuthEnabled(): boolean {
+  // If we are using an OpenAI-compatible/Minimax proxy, unconditionally disable official Anthropic Auth
+  if (getAPIProvider() === 'openai-compatible') {
+    return false
+  }
+
   // --bare: API-key-only, never OAuth.
+
   if (isBareMode()) return false
 
   // `claude ssh` remote: ANTHROPIC_UNIX_SOCKET tunnels API calls through a
@@ -229,7 +235,14 @@ export function getAnthropicApiKeyWithSource(
   key: null | string
   source: ApiKeySource
 } {
+  // FAST-PATH: Priority to ANTHROPIC_API_KEY environment variable. 
+  // Especially important for OpenAI-compatible/Minimax providers.
+  if (process.env.ANTHROPIC_API_KEY) {
+    return { key: process.env.ANTHROPIC_API_KEY, source: 'ANTHROPIC_API_KEY' }
+  }
+
   // --bare: hermetic auth. Only ANTHROPIC_API_KEY env or apiKeyHelper from
+
   // the --settings flag. Never touches keychain, config file, or approval
   // lists. 3P (Bedrock/Vertex/Foundry) uses provider creds, not this path.
   if (isBareMode()) {

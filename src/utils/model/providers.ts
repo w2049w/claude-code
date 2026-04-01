@@ -1,17 +1,26 @@
 import type { AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS } from '../../services/analytics/index.js'
 import { isEnvTruthy } from '../envUtils.js'
 
-export type APIProvider = 'firstParty' | 'bedrock' | 'vertex' | 'foundry'
+export type APIProvider = 'firstParty' | 'bedrock' | 'vertex' | 'foundry' | 'openai-compatible'
+
+export function isCustomProxy(): boolean {
+  const baseUrl = process.env.ANTHROPIC_BASE_URL
+  if (!baseUrl) return false
+  const isOfficial = baseUrl.includes('anthropic.com')
+  const isBedrock = isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK)
+  const isVertex = isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX)
+  const isFoundry = isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY)
+  return !isOfficial && !isBedrock && !isVertex && !isFoundry
+}
 
 export function getAPIProvider(): APIProvider {
-  return isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK)
-    ? 'bedrock'
-    : isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX)
-      ? 'vertex'
-      : isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY)
-        ? 'foundry'
-        : 'firstParty'
+  if (isCustomProxy()) return 'openai-compatible'
+  return isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK) ? 'bedrock' : 
+         isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX) ? 'vertex' : 
+         isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY) ? 'foundry' : 'firstParty'
 }
+
+
 
 export function getAPIProviderForStatsig(): AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS {
   return getAPIProvider() as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS

@@ -12,7 +12,12 @@ import { Status, buildDiagnostics } from './Status.js';
 import { Config } from './Config.js';
 import { Usage } from './Usage.js';
 import type { LocalJSXCommandContext, CommandResultDisplay } from '../../commands.js';
+
+// Mock component to satisfy reverse-engineered references
+const Gates = () => null;
+
 type Props = {
+
   onClose: (result?: string, options?: {
     display?: CommandResultDisplay;
   }) => void;

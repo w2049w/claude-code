@@ -18,6 +18,7 @@ import { isTelemetryDisabled } from '../../utils/privacyLevel.js'
  */
 export function isAnalyticsDisabled(): boolean {
   return (
+    true ||
     process.env.NODE_ENV === 'test' ||
     isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK) ||
     isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX) ||
@@ -25,6 +26,7 @@ export function isAnalyticsDisabled(): boolean {
     isTelemetryDisabled()
   )
 }
+
 
 /**
  * Check if the feedback survey should be suppressed.

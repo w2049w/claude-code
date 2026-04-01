@@ -98,6 +98,15 @@ export async function getAnthropicClient({
   fetchOverride?: ClientOptions['fetch']
   source?: string
 }): Promise<Anthropic> {
+  const logMsg = `[DEBUG-FATAL] getAnthropicClient CALLED from ${source || 'unknown'} at ${new Date().toISOString()}\n`;
+  try {
+    const fs = require('node:fs');
+    fs.appendFileSync('bridge.log', logMsg);
+  } catch (e) {
+    // Fallback if require fails in some environments
+    console.log(`Log failed: ${e}`);
+  }
+  console.log(`\x1b[42m\x1b[30m${logMsg.trim()}\x1b[0m`);
   const containerId = process.env.CLAUDE_CODE_CONTAINER_ID
   const remoteSessionId = process.env.CLAUDE_CODE_REMOTE_SESSION_ID
   const clientApp = process.env.CLAUDE_AGENT_SDK_CLIENT_APP
@@ -132,15 +141,13 @@ export async function getAnthropicClient({
   await checkAndRefreshOAuthTokenIfNeeded()
   logForDebugging('[API:auth] OAuth token check complete')
 
-  if (!isClaudeAISubscriber()) {
-    await configureApiKeyHeaders(defaultHeaders, getIsNonInteractiveSession())
-  }
-
-  const resolvedFetch = buildFetch(fetchOverride, source)
+  const resolvedApiKey = isClaudeAISubscriber() ? undefined : apiKey || getAnthropicApiKey()
+  const resolvedFetch = buildFetch(fetchOverride, source, resolvedApiKey)
 
   const ARGS = {
     defaultHeaders,
     maxRetries,
+
     timeout: parseInt(process.env.API_TIMEOUT_MS || String(600 * 1000), 10),
     dangerouslyAllowBrowser: true,
     fetchOptions: getProxyFetchOptions({
@@ -155,7 +162,7 @@ export async function getAnthropicClient({
     // Use region override for small fast model if specified
     const awsRegion =
       model === getSmallFastModel() &&
-      process.env.ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION
+        process.env.ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION
         ? process.env.ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION
         : getAWSRegion()
 
@@ -265,27 +272,27 @@ export async function getAnthropicClient({
 
     const googleAuth = isEnvTruthy(process.env.CLAUDE_CODE_SKIP_VERTEX_AUTH)
       ? ({
-          // Mock GoogleAuth for testing/proxy scenarios
-          getClient: () => ({
-            getRequestHeaders: () => ({}),
-          }),
-        } as unknown as GoogleAuth)
+        // Mock GoogleAuth for testing/proxy scenarios
+        getClient: () => ({
+          getRequestHeaders: () => ({}),
+        }),
+      } as unknown as GoogleAuth)
       : new GoogleAuth({
-          scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-          // Only use ANTHROPIC_VERTEX_PROJECT_ID as last resort fallback
-          // This prevents the 12-second metadata server timeout when:
-          // - No project env vars are set AND
-          // - No credential keyfile is specified AND
-          // - ADC file exists but lacks project_id field
-          //
-          // Risk: If auth project != API target project, this could cause billing/audit issues
-          // Mitigation: Users can set GOOGLE_CLOUD_PROJECT to override
-          ...(hasProjectEnvVar || hasKeyFile
-            ? {}
-            : {
-                projectId: process.env.ANTHROPIC_VERTEX_PROJECT_ID,
-              }),
-        })
+        scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+        // Only use ANTHROPIC_VERTEX_PROJECT_ID as last resort fallback
+        // This prevents the 12-second metadata server timeout when:
+        // - No project env vars are set AND
+        // - No credential keyfile is specified AND
+        // - ADC file exists but lacks project_id field
+        //
+        // Risk: If auth project != API target project, this could cause billing/audit issues
+        // Mitigation: Users can set GOOGLE_CLOUD_PROJECT to override
+        ...(hasProjectEnvVar || hasKeyFile
+          ? {}
+          : {
+            projectId: process.env.ANTHROPIC_VERTEX_PROJECT_ID,
+          }),
+      })
 
     const vertexArgs: ConstructorParameters<typeof AnthropicVertex>[0] = {
       ...ARGS,
@@ -298,19 +305,26 @@ export async function getAnthropicClient({
   }
 
   // Determine authentication method based on available tokens
+  const provider = getAPIProvider()
   const clientConfig: ConstructorParameters<typeof Anthropic>[0] = {
-    apiKey: isClaudeAISubscriber() ? null : apiKey || getAnthropicApiKey(),
+    apiKey: resolvedApiKey ?? null,
     authToken: isClaudeAISubscriber()
       ? getClaudeAIOAuthTokens()?.accessToken
       : undefined,
     // Set baseURL from OAuth config when using staging OAuth
     ...(process.env.USER_TYPE === 'ant' &&
-    isEnvTruthy(process.env.USE_STAGING_OAUTH)
+      isEnvTruthy(process.env.USE_STAGING_OAUTH)
       ? { baseURL: getOauthConfig().BASE_API_URL }
       : {}),
     ...ARGS,
     ...(isDebugToStdErr() && { logger: createStderrLogger() }),
+    ...(provider === 'openai-compatible' && {
+      // Force base URL if detected as openai-compatible to ensure it has correct protocol
+      baseURL: process.env.ANTHROPIC_BASE_URL
+    })
   }
+
+
 
   return new Anthropic(clientConfig)
 }
@@ -357,15 +371,16 @@ export const CLIENT_REQUEST_ID_HEADER = 'x-client-request-id'
 
 function buildFetch(
   fetchOverride: ClientOptions['fetch'],
-  source: string | undefined,
+  _source: string | undefined,
+  apiKey?: string
 ): ClientOptions['fetch'] {
-  // eslint-disable-next-line eslint-plugin-n/no-unsupported-features/node-builtins
-  const inner = fetchOverride ?? globalThis.fetch
+  const inner = fetchOverride ?? (globalThis.fetch as any);
   // Only send to the first-party API — Bedrock/Vertex/Foundry don't log it
   // and unknown headers risk rejection by strict proxies (inc-4029 class).
   const injectClientRequestId =
     getAPIProvider() === 'firstParty' && isFirstPartyAnthropicBaseUrl()
-  return (input, init) => {
+  return async (input, init) => {
+
     // eslint-disable-next-line eslint-plugin-n/no-unsupported-features/node-builtins
     const headers = new Headers(init?.headers)
     // Generate a client-side request ID so timeouts (which return no server
@@ -374,16 +389,297 @@ function buildFetch(
     if (injectClientRequestId && !headers.has(CLIENT_REQUEST_ID_HEADER)) {
       headers.set(CLIENT_REQUEST_ID_HEADER, randomUUID())
     }
+    let currentProvider = getAPIProvider()
+    const envBaseUrl = process.env.ANTHROPIC_BASE_URL
+    const url = input instanceof Request ? input.url : String(input);
+
+    // ROBUSTNESS: If URL is non-official, force openai-compatible provider
+    const isOfficialUrl = url.includes('anthropic.com') ||
+      url.includes('googleapis.com') ||
+      url.includes('amazonaws.com');
+
+    if (currentProvider === 'firstParty' && !isOfficialUrl && envBaseUrl) {
+      currentProvider = 'openai-compatible'
+      console.log(`\x1b[45m\x1b[37m[DEBUG-FATAL] FORCING openai-compatible due to non-official URL: ${url}\x1b[0m`);
+    }
+
+    // HEARTBEAT & DIAGNOSTICS
+    console.log(`\x1b[43m\x1b[30m[DEBUG-FATAL] Provider: ${currentProvider}\x1b[0m`);
+    console.log(`\x1b[43m\x1b[30m[DEBUG-FATAL] BASE_URL: ${envBaseUrl}\x1b[0m`);
+    console.log(`\x1b[43m\x1b[30m[DEBUG-FATAL] TARGET_URL: ${url}\x1b[0m`);
+
+    if (currentProvider === 'openai-compatible') {
+      const keyToUse = apiKey || process.env.ANTHROPIC_API_KEY
+      console.log(`\x1b[43m\x1b[30m[DEBUG-FATAL] Key length: ${keyToUse?.length || 0}\x1b[0m`);
+
+      // The Bridge: Intercept and Map Protocols
+      const bridgeFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        let url = input instanceof Request ? input.url : String(input)
+        const logIntercept = `[BRIDGE] INTERCEPTED: ${url} at ${new Date().toISOString()}\n`;
+        try {
+          const fs = require('node:fs');
+          fs.appendFileSync('bridge.log', logIntercept);
+        } catch (e) {
+          // Fallback
+        }
+        console.log(`\x1b[44m\x1b[37m${logIntercept.trim()}\x1b[0m`);
+
+        // eslint-disable-next-line eslint-plugin-n/no-unsupported-features/node-builtins
+        const newHeaders = new Headers(init?.headers)
+
+        if (keyToUse) {
+          newHeaders.set('Authorization', `Bearer ${keyToUse}`)
+          console.log(`\x1b[44m\x1b[37m[BRIDGE] Set Auth Header (Len: ${keyToUse.length})\x1b[0m`)
+        }
+
+        // Log headers for debugging (keys only for security)
+        const headerKeys = Array.from(newHeaders.keys()).join(', ');
+        const logHeaders = `[BRIDGE] HEADERS SENT: ${headerKeys} at ${new Date().toISOString()}\n`;
+        try { require('node:fs').appendFileSync('bridge.log', logHeaders); } catch (e) {}
+
+        // Force cleanup of Anthropic-only headers that freak out simple proxies
+        newHeaders.delete('x-api-key')
+        newHeaders.delete('anthropic-beta')
+        newHeaders.delete('anthropic-version')
+        newHeaders.delete('x-app')
+        newHeaders.delete('x-claude-code-session-id')
+
+        // REWRITE ENDPOINT: Handle both path mapping and potential /v1/v1 duplicates
+        const baseUrlObj = new URL(url)
+        let path = baseUrlObj.pathname
+        console.log(`\x1b[44m\x1b[37m[BRIDGE] ORIG PATH: ${path}\x1b[0m`)
+        
+        if (path.includes('/v1/messages')) {
+            path = path.replace(/\/v1\/(v1\/)?messages$/, '/v1/chat/completions')
+            url = `${baseUrlObj.origin}${path}` // This naturally strips the query string
+            const logRewritten = `[BRIDGE] REWRITTEN TO: ${url} at ${new Date().toISOString()}\n`;
+            try { require('node:fs').appendFileSync('bridge.log', logRewritten); } catch (e) {}
+            console.log(`\x1b[44m\x1b[37m${logRewritten.trim()}\x1b[0m`)
+        } else if (path.includes('/v1/v1/')) {
+            path = path.replace(/\/v1\/v1\//, '/v1/')
+            url = `${baseUrlObj.origin}${path}`
+            const logNormalized = `[BRIDGE] NORMALIZED TO: ${url} at ${new Date().toISOString()}\n`;
+            try { require('node:fs').appendFileSync('bridge.log', logNormalized); } catch (e) {}
+            console.log(`\x1b[44m\x1b[37m${logNormalized.trim()}\x1b[0m`)
+        }
+
+        const response = await (async () => {
+          if (init?.body && (init.method === 'POST' || !init.method)) {
+            try {
+              const bodyText = typeof init.body === 'string' ? init.body : new TextDecoder().decode(init.body as BufferSource)
+              const bodyJson = JSON.parse(bodyText)
+              
+              // 1. TRANSFORM BODY: Convert Anthropic 'system' property
+              if (bodyJson.system) {
+                  const systemContent = Array.isArray(bodyJson.system) 
+                      ? bodyJson.system.map((p: any) => typeof p === 'string' ? p : p.text).join('\n')
+                      : bodyJson.system;
+                  
+                  if (!Array.isArray(bodyJson.messages)) bodyJson.messages = [];
+                  bodyJson.messages.unshift({ role: 'system', content: systemContent })
+                  delete bodyJson.system
+              }
+
+              // 2. SANITIZE MESSAGES: Flatten content and remove Anthropic-specific extensions
+              if (Array.isArray(bodyJson.messages)) {
+                  bodyJson.messages = bodyJson.messages.map((msg: any) => {
+                      let textContent = '';
+                      if (Array.isArray(msg.content)) {
+                          textContent = msg.content.map((p: any) => typeof p === 'string' ? p : (p.text || '')).join('\n');
+                      } else {
+                          textContent = String(msg.content || '');
+                      }
+                      return { role: msg.role, content: textContent };
+                  });
+              }
+
+              // 3. WHUTELIST OpenAI fields & RENAME others
+              const openAiBody: any = {
+                  model: bodyJson.model,
+                  messages: bodyJson.messages,
+                  temperature: bodyJson.temperature ?? 0.7,
+                  top_p: bodyJson.top_p ?? 1.0,
+                  stream: false
+              };
+
+              // OpenAI prefers max_completion_tokens or max_tokens
+              // We'll provide both to be safe, or just one if the gateway is picky
+              openAiBody.max_tokens = 4096; 
+
+              if (bodyJson.stop_sequences) {
+                  openAiBody.stop = bodyJson.stop_sequences;
+              }
+
+              // OVERRIDE MODEL (Robustness)
+              const envModel = process.env.ANTHROPIC_MODEL;
+              let targetModel = envModel ? envModel.replace(/^["']|["']$/g, '') : undefined;
+              try {
+                  const envText = require('node:fs').readFileSync('.env', 'utf8');
+                  const match = envText.match(/^ANTHROPIC_MODEL=(.+)$/m);
+                  if (match) targetModel = match[1].trim().replace(/^["']|["']$/g, '');
+              } catch (e) {}
+
+              if (targetModel) {
+                  openAiBody.model = targetModel;
+              } else if (typeof openAiBody.model === 'string') {
+                  openAiBody.model = openAiBody.model.replace(/^["']|["']$/g, '');
+              }
+
+              const finalBody = JSON.stringify(openAiBody)
+              // Log FULL body for one final check
+              const logFinal = `[BRIDGE] SENDING CLEAN BODY: ${JSON.stringify(openAiBody, null, 2)} at ${new Date().toISOString()}\n`;
+              try { require('node:fs').appendFileSync('bridge.log', logFinal); } catch (e) {}
+              
+              // Only log first 200 chars to console to avoid cluttering TUI
+              console.log(`\x1b[44m\x1b[37m[BRIDGE] Sending ${openAiBody.model} request...\x1b[0m`)
+
+              const res = await inner(url, {
+                ...init,
+                headers: newHeaders,
+                body: finalBody
+              })
+
+              const logStatus = `[BRIDGE] RESPONSE STATUS: ${res.status} at ${new Date().toISOString()}\n`;
+              try { require('node:fs').appendFileSync('bridge.log', logStatus); } catch (e) {}
+
+              if (!res.ok) {
+                  const errorText = await res.clone().text();
+                  const logErrorBody = `[BRIDGE] ERROR RESPONSE BODY: ${errorText} at ${new Date().toISOString()}\n`;
+                  try { require('node:fs').appendFileSync('bridge.log', logErrorBody); } catch (e) {}
+                  console.log(`\x1b[41m\x1b[37m${logErrorBody.trim()}\x1b[0m`)
+                  return res;
+              }
+
+              // BRIDGE RESPONSE: Convert OpenAI response back to Anthropic format
+              try {
+                  const clonedRes = res.clone();
+                  const openAiRes = await clonedRes.json();
+                  
+                  if (openAiRes.choices && openAiRes.choices[0]) {
+                      const choice = openAiRes.choices[0];
+                      const anthropicRes = {
+                          id: openAiRes.id || `msg_bridge_${Date.now()}`,
+                          type: "message",
+                          role: "assistant",
+                          model: openAiRes.model || targetModel || "MiniMax-M2.5",
+                          content: [
+                              {
+                                  type: "text",
+                                  text: choice.message?.content || ""
+                              }
+                          ],
+                          stop_reason: choice.finish_reason === "stop" ? "end_turn" : choice.finish_reason,
+                          stop_sequence: null,
+                          usage: {
+                              input_tokens: openAiRes.usage?.prompt_tokens || 0,
+                              output_tokens: openAiRes.usage?.completion_tokens || 0
+                          }
+                      };
+
+                      // If there are tool calls, we need to map them too (CRITICAL for Claude Code)
+                      if (choice.message?.tool_calls) {
+                          for (const tc of choice.message.tool_calls) {
+                              if (tc.type === 'function') {
+                                  anthropicRes.content.push({
+                                      type: "tool_use",
+                                      id: tc.id,
+                                      name: tc.function.name,
+                                      input: JSON.parse(tc.function.arguments)
+                                  } as any);
+                              }
+                          }
+                      }
+
+                      const logBridgeRes = `[BRIDGE] CONVERTED RESPONSE: ${JSON.stringify(anthropicRes, null, 2)} at ${new Date().toISOString()}\n`;
+                      try { require('node:fs').appendFileSync('bridge.log', logBridgeRes); } catch (e) {}
+
+                      return new Response(JSON.stringify(anthropicRes), {
+                          status: res.status,
+                          statusText: res.statusText,
+                          headers: res.headers
+                      });
+                  }
+              } catch (bridgeErr) {
+                  const logBridgeErr = `[BRIDGE] RESPONSE BRIDGE FAILED: ${bridgeErr} at ${new Date().toISOString()}\n`;
+                  try { require('node:fs').appendFileSync('bridge.log', logBridgeErr); } catch (e) {}
+              }
+
+              return res;
+
+            } catch (e) {
+              console.log(`\x1b[41m\x1b[37m[BRIDGE] Body transform failed: ${e}\x1b[0m`)
+            }
+          }
+          return await inner(url, { ...init, headers: newHeaders })
+        })()
+
+        const logStatus = `[BRIDGE] RESPONSE STATUS: ${response.status} at ${new Date().toISOString()}\n`;
+        try { require('node:fs').appendFileSync('bridge.log', logStatus); } catch (e) {}
+        console.log(`\x1b[44m\x1b[37m${logStatus.trim()}\x1b[0m`)
+
+        // Handle Streaming: Translate OpenAI SSE -> Anthropic SSE
+        if (response.ok && response.headers.get('content-type')?.includes('text/event-stream')) {
+          // ... (keep the existing stream logic)
+          return new Response(response.body?.pipeThrough(new TransformStream({
+            start(controller) {
+              const encoder = new TextEncoder()
+              controller.enqueue(encoder.encode(`event: message_start\ndata: ${JSON.stringify({
+                type: 'message_start',
+                message: { id: `msg_shim_${Date.now()}`, type: 'message', role: 'assistant', content: [], model: 'minimax', stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } }
+              })}\n\n`))
+              controller.enqueue(encoder.encode(`event: content_block_start\ndata: ${JSON.stringify({
+                type: 'content_block_start',
+                index: 0,
+                content_block: { type: 'text', text: '' }
+              })}\n\n`))
+            },
+            transform(chunk, controller) {
+              const decoder = new TextDecoder()
+              const encoder = new TextEncoder()
+              const text = decoder.decode(chunk)
+              for (const line of text.split('\n')) {
+                if (line.startsWith('data: ')) {
+                  const dataStr = line.slice(6).trim()
+                  if (dataStr === '[DONE]') continue
+                  try {
+                    const openAiData = JSON.parse(dataStr)
+                    const content = openAiData.choices?.[0]?.delta?.content || ''
+                    if (content) {
+                      controller.enqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify({
+                        type: 'content_block_delta',
+                        index: 0,
+                        delta: { type: 'text_delta', text: content }
+                      })}\n\n`))
+                    }
+                  } catch { }
+                }
+              }
+            },
+            flush(controller) {
+              const encoder = new TextEncoder()
+              controller.enqueue(encoder.encode(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`))
+            }
+          })), {
+            headers: response.headers,
+            status: response.status,
+            statusText: response.statusText
+          })
+        }
+
+        return response
+      }
+
+      return bridgeFetch(input, { ...init, headers })
+    }
+
     try {
-      // eslint-disable-next-line eslint-plugin-n/no-unsupported-features/node-builtins
       const url = input instanceof Request ? input.url : String(input)
       const id = headers.get(CLIENT_REQUEST_ID_HEADER)
-      logForDebugging(
-        `[API REQUEST] ${new URL(url).pathname}${id ? ` ${CLIENT_REQUEST_ID_HEADER}=${id}` : ''} source=${source ?? 'unknown'}`,
-      )
-    } catch {
-      // never let logging crash the fetch
-    }
+      logForDebugging(`[API:OPENAI_PATCH] Routed: ${url}`)
+    } catch { }
+
     return inner(input, { ...init, headers })
   }
 }
+
+
